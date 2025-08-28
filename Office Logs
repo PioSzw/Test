@@ -1,0 +1,30 @@
+<#
+.SYNOPSIS
+Reads and outputs content from Evergreen Office update remediation logs
+Uses dynamic date formatting to match automated file nomenclature
+#>
+
+# Configure error handling
+$ErrorActionPreference = "Stop"
+
+try {
+    # Construct dynamic log path
+    $logDate = Get-Date -Format "yyyyMMdd"
+    $logPath = Join-Path -Path "C:\Support\Logs\RemediationEvergreen" -ChildPath "OfficeUpdateScript_$logDate.log"
+
+    # Verify log existence
+    if (-not (Test-Path $logPath)) {
+        throw "Log file not found: $logPath"
+    }
+
+    # Read and output contents
+    Write-Output "Reading log contents:"
+    Get-Content $logPath
+    Write-Output "Log review completed successfully"
+
+    exit 1
+}
+catch {
+    Write-Output "Error"
+    exit 2
+}
