@@ -1,0 +1,275 @@
+# Script Variables
+$ScriptVersion = "2.0"
+$LogFolderPath = "C:\Support\Logs\RemediationEvergreen"
+$LogFileName = "OfficeUpdateScript_$(Get-Date -Format 'yyyyMMdd').log"
+$ServiceName = "ClickToRunSvc"
+$RegistryPath = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+$CDNBaseUrlCurrentChannel = "http://officecdn.microsoft.com/pr/492350f6-3a01-4f97-b9c0-c7c6ddf67d60"
+$CDNBaseUrlMonthlyEnt = "http://officecdn.microsoft.com/pr/55336b82-a18d-4dd6-b5f6-9e5095c314a6"
+
+# Latest versions storage
+[string]$global:n = ""
+[string]$global:n_1 = ""
+[string]$global:n_2 = ""
+
+# Ensure the RemediationEvergreen directory exists
+if (!(Test-Path -Path $LogFolderPath)) {
+    try {
+        New-Item -Path $LogFolderPath -ItemType Directory -Force | Out-Null
+    } catch {
+        Write-Warning "Failed to create log directory: $($_.Exception.Message)"
+        exit 1
+    }
+}
+
+# Function to write log entries
+function Write-LogEntry {
+    param (
+        [parameter(Mandatory = $true, HelpMessage = "Value added to the log file.")]
+        [ValidateNotNullOrEmpty()]
+        [string]$Value,
+        
+        [parameter(Mandatory = $true, HelpMessage = "Severity for the log entry. 1 for Informational, 2 for Warning and 3 for Error.")]
+        [ValidateNotNullOrEmpty()]
+        [ValidateSet("1", "2", "3")]
+        [string]$Severity,
+        
+        [parameter(Mandatory = $false, HelpMessage = "Name of the log file that the entry will be written to.")]
+        [ValidateNotNullOrEmpty()]
+        [string]$FileName = $LogFileName
+    )
+
+    $LogFilePath = Join-Path -Path $LogFolderPath -ChildPath $FileName
+
+    # Construct time stamp for log entry
+    $Time = -join @((Get-Date -Format "HH:mm:ss.fff"), " ", (Get-WmiObject -Class Win32_TimeZone | Select-Object -ExpandProperty Bias))
+
+    # Construct date for log entry
+    $Date = (Get-Date -Format "MM-dd-yyyy")
+
+    # Construct context for log entry
+    $Context = $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)
+
+    # Construct final log entry
+    $LogText = "<![LOG[$($Value)]LOG]!><time=""$($Time)"" date=""$($Date)"" component=""$($FileName)"" context=""$($Context)"" type=""$($Severity)"" thread=""$($PID)"" file="""">"
+
+    # Add value to log file
+    try {
+        Add-Content -Path $LogFilePath -Value $LogText -Force
+
+        # Output to console based on severity
+        switch ($Severity) {
+            "1" { Write-Verbose $Value }
+            "2" { Write-Host $Value -ForegroundColor Yellow }
+            "3" { Write-Warning $Value }
+        }
+    }
+    catch {
+        Write-Warning "Failed to write to log file: $($_.Exception.Message)"
+    }
+}
+
+# Function to get the latest available versions for Semi-Annual Enterprise Channel
+function Get-LatestVersions {
+
+    # Fetching the latest versions from the Microsoft update page
+    $SemiAnnualURL = "https://learn.microsoft.com/en-us/officeupdates/update-history-microsoft365-apps-by-date"
+    $SemiAnnualHTML = Invoke-WebRequest -Uri $SemiAnnualURL
+
+    # Extracting versions for Semi-Annual Enterprise Channel, excluding version 2408 and preview versions
+    $semiAnnual = [regex]::Matches($SemiAnnualHTML.Content, '<a href=\"semi-annual-enterprise-channel(.*?)</a>') | Where-Object { $_.Value -notmatch "2408" -and $_.Value -notmatch "2308" -and $_.Value -notmatch "preview" }
+
+    for ($i = 0; $i -lt [math]::Min(2, $semiAnnual.Count); $i++) {
+        $date_build = ([regex]::matches($semiAnnual[$i].Value, 'Version \d{4} \(Build \d{4,5}\.\d{4,5}\)').Value)
+
+        # Trim version to the format "16.0.(build)"
+        $trimmed_build = "16.0." + ([regex]::Match($date_build, 'Build (\d{4,5}\.\d{4,5})').Groups[1].Value)
+
+        # Replace Write-Host with Write-LogEntry
+        Write-LogEntry -Value "Version: $date_build" -Severity "1"
+
+        if ($i -eq 0) {
+            $global:n = $trimmed_build
+        } elseif ($i -eq 1) {
+            $global:n_1 = $trimmed_build
+        }
+    }
+}
+function Remove-UpdateToVersionRegistry {
+    param (
+        [Parameter(Mandatory=$true)]
+        [bool]$WasSuccessful,
+        [Parameter(Mandatory=$true)]
+        [int]$AttemptNumber
+    )
+
+    # Registry path for UpdateToVersion
+    $registryPath = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+    $registryName = "UpdateToVersion"
+
+    try {
+        # Check if registry key exists
+        if (Get-ItemProperty -Path $registryPath -Name $registryName -ErrorAction SilentlyContinue) {
+            if ($WasSuccessful) {
+                Write-LogEntry -Value "Patch was successful. Removing UpdateToVersion registry key." -Severity "1"
+                Remove-ItemProperty -Path $registryPath -Name $registryName -Force
+                Write-LogEntry -Value "UpdateToVersion registry key removed successfully." -Severity "1"
+            }
+            elseif ($AttemptNumber -eq 3) {
+                Write-LogEntry -Value "Patch failed after 3 attempts. Removing UpdateToVersion registry key." -Severity "2"
+                Remove-ItemProperty -Path $registryPath -Name $registryName -Force
+                Write-LogEntry -Value "UpdateToVersion registry key removed after failed attempts." -Severity "2"
+            }
+            else {
+                Write-LogEntry -Value "Attempt $AttemptNumber failed but not yet at maximum attempts. Keeping UpdateToVersion registry key." -Severity "2"
+            }
+        }
+        else {
+            Write-LogEntry -Value "UpdateToVersion registry key not found." -Severity "2"
+        }
+    }
+    catch {
+        Write-LogEntry -Value "Error removing UpdateToVersion registry key: $($_.Exception.Message)" -Severity "3"
+    }
+}
+
+# Function to check and apply updates with retry mechanism
+function Update-OfficeWithRetry {
+    param (
+        [int]$MaxRetries = 3
+    )
+
+    $retryCount = 0
+    $success = $false
+
+    while ($retryCount -lt $MaxRetries -and -not $success) {
+        $retryCount++
+        Write-LogEntry -Value "Attempt $retryCount of $MaxRetries to update Office." -Severity "1"
+
+        # Trigger Click-to-Run update
+        $process = Start-Process -FilePath "$env:CommonProgramFiles\microsoft shared\ClickToRun\OfficeC2RClient.exe" -ArgumentList "/update user updatetoversion=$n" -PassThru
+        Write-LogEntry -Value "Microsoft 365 Apps are being updated to $n..." -Severity "1"
+
+        # Wait for the update to complete
+        $starttime = Get-Date
+        do {
+            Write-LogEntry -Value "Update in progress. Waiting 60 seconds." -Severity "1"
+                                        # Check if the update was successful
+        $CurrentVersion = (Get-ItemProperty -Path $RegistryPath -Name "VersionToReport").VersionToReport
+        if ($CurrentVersion -eq $n) {
+            Write-LogEntry -Value "Device is compliant with the latest version $n after attempt $retryCount." -Severity "1"
+            $success = $true
+            exit 0
+        } else {
+            Write-LogEntry -Value "Update attempt failed. Current version: $CurrentVersion" -Severity "2"
+        }
+            Start-Sleep -Seconds 60
+        } while (!(Get-Process -Name "OfficeC2RClient" -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -gt $starttime }))
+
+        # Wait for user to close any popups
+        do {
+            Write-LogEntry -Value "Waiting for the user to close the popup." -Severity "1"
+                    # Check if the update was successful
+                $CurrentVersion = (Get-ItemProperty -Path $RegistryPath -Name "VersionToReport").VersionToReport
+        if ($CurrentVersion -eq $n) {
+            Write-LogEntry -Value "Device is compliant with the latest version $n after attempt $retryCount." -Severity "1"
+            $success = $true
+            exit 0
+        } else {
+            Write-LogEntry -Value "Update attempt failed. Current version: $CurrentVersion" -Severity "2"     
+        }
+            Start-Sleep -Seconds 60
+        } while (Get-Process -Name "OfficeC2RClient" -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -gt $starttime })
+
+        Remove-UpdateToVersionRegistry -WasSuccessful $false -AttemptNumber $retryCount
+    }
+
+    if (-not $success) {
+        Write-LogEntry -Value "All update attempts failed. Exiting with error." -Severity "3"
+        # Final call to Remove-UpdateToVersionRegistry after all attempts failed
+        Remove-UpdateToVersionRegistry -WasSuccessful $false -AttemptNumber $MaxRetries
+        exit 1
+    }
+}
+
+function Set-OfficeUpdateChannel {
+    $RegPath = "HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\Configuration"
+    $RegNameChannel = "UpdateChannel"
+    $RegNameAudience = "AudienceId"
+
+    if (Test-Path $RegPath) {
+        $UpdateChannel = (Get-ItemProperty -Path $RegPath -Name $RegNameChannel -ErrorAction SilentlyContinue).$RegNameChannel
+
+        # If UpdateChannel is NOT "Semi-Annual Enterprise Channel", end function
+        if ($UpdateChannel -ne "Semi-Annual Enterprise Channel") {
+            Write-LogEntry -Value "UpdateChannel is not set to Semi-Annual Enterprise Channel. Current channel: $UpdateChannel. Operation canceled." -Severity "1"
+            return # Exit the function
+        }
+
+        # If we get here, it means UpdateChannel IS "Semi-Annual Enterprise Channel"
+        $AudienceId = (Get-ItemProperty -Path $RegPath -Name $RegNameAudience -ErrorAction SilentlyContinue).$RegNameAudience
+
+        if ($AudienceId -in @("89815e81-c82e-49a3-99dc-2b99229cf632", "7ffbc6bf-bc32-4f92-8982-f9dd17fd3114")) {
+            $NewChannel = "http://officecdn.microsoft.com/pr/7ffbc6bf-bc32-4f92-8982-f9dd17fd3114"
+            Write-LogEntry -Value "Matching AudienceId found. Changing to Semi-Annual Enterprise Channel CDN: $NewChannel" -Severity "1"
+            Set-ItemProperty -Path $RegPath -Name $RegNameChannel -Value $NewChannel
+            Write-LogEntry -Value "UpdateChannel changed to Semi-Annual Enterprise Channel CDN." -Severity "1"
+        } else {
+            Write-LogEntry -Value "AudienceId does not match required values. Operation canceled." -Severity "3"
+            exit 1
+        }
+    } else {
+        Write-LogEntry -Value "Registry path does not exist." -Severity "3"
+        exit 1
+    }
+}
+
+# Main Script Execution
+try {
+    # Ensure the Click-to-Run service is running
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
+        $ServiceStatus = (Get-Service -Name $ServiceName).Status
+        if ($ServiceStatus -eq "Running") {
+            Write-LogEntry -Value "Service is running. Restarting..." -Severity "1"
+            Restart-Service -Name $ServiceName -Force
+        } elseif ($ServiceStatus -eq "Stopped") {
+            Write-LogEntry -Value "Service is stopped. Starting..." -Severity "1"
+            Start-Service -Name $ServiceName
+        }
+        Write-LogEntry -Value "Click-to-Run service is now running." -Severity "1"
+    } else {
+        Write-LogEntry -Value "Service $ServiceName does not exist on this system." -Severity "3"
+        exit 1
+    }
+
+    # Get the latest versions
+    Get-LatestVersions
+
+    # Check compliance and update if necessary
+    $CurrentVersion = (Get-ItemProperty -Path $RegistryPath -Name "VersionToReport").VersionToReport
+    if ($CurrentVersion -eq $n) {
+        Write-LogEntry -Value "Device is compliant with the latest version $n." -Severity "1"
+        exit 0
+    } else {
+        Write-LogEntry -Value "Device is not compliant. Current version: $CurrentVersion. Attempting update..." -Severity "2"
+    }
+
+    # Check if the CDN is set to Current Channel or Monthly Enterprise and exit if true
+    $CurrentChannel = (Get-ItemProperty -Path $RegistryPath -Name "UpdateChannel").UpdateChannel
+    Write-LogEntry -Value "Current Channel is: $CurrentChannel" -Severity "1"
+    if ($CurrentChannel -eq $CDNBaseUrlMonthlyEnt -or $CurrentChannel -eq $CDNBaseUrlCurrentChannel) {
+        Write-LogEntry -Value "Device is set to an incorrect channel (Current or Monthly Enterprise)." -Severity "3"
+        exit 1
+    }
+
+    # **Call Set-OfficeUpdateChannel here to ensure the channel is set correctly**
+    Set-OfficeUpdateChannel
+
+    # Start the update process with retry mechanism
+    Update-OfficeWithRetry -MaxRetries 3
+} catch {
+    Write-LogEntry -Value "An error occurred: $_" -Severity "3"
+    exit 1
+} finally {
+    Write-LogEntry -Value "=== Script End ===" -Severity "1"
+}
